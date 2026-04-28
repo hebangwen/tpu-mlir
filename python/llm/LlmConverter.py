@@ -234,7 +234,7 @@ class LlmConverter(BaseConverter):
         weight_op = mlir_gen.create_weight_op(norm_path + ".weight", norm_shape)
         loc_name = name if name else norm_path
         eps = self.rms_norm_eps if eps is None else eps
-        weight_keep_f32 = True if self.llm_type in [LlmType.GEMMA3] else False
+        weight_keep_f32 = True if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4] else False
         return top.RMSNormOp(mlir_gen.get_tensor_type(input_shape),
                              in_op,
                              weight_op,
@@ -449,7 +449,7 @@ class LlmConverter(BaseConverter):
         self.decoder_sparse_step = getattr(self.llm_config, "decoder_sparse_step", 1)
         # for minicpm4
         self.scale_emb = getattr(self.llm_config, "scale_emb", 1.)
-        if self.llm_type == LlmType.GEMMA3:
+        if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4]:
             self.scale_emb = self.hidden_size**0.5
         self.scale_depth = getattr(self.llm_config, "scale_depth", 1.)
         self.dim_model_base = getattr(self.llm_config, "dim_model_base", 1.)
@@ -1508,7 +1508,7 @@ class LlmConverter(BaseConverter):
         if has_weight:
             data = self.model.read(weight_path)
             if type == WeightType.ZEROCENTERED_RMSNORM:
-                data = data + 1.0  # GEMMA3 RMSNorm weight is not same as others
+                data = data + 1.0  # GEMMA3/GEMMA4 RMSNorm weight is not same as others
             weight_dict[weight_path] = data
         if has_bias:
             weight_dict[bias_path] = self.model.read(bias_path)
@@ -1571,6 +1571,24 @@ class LlmConverter(BaseConverter):
         v_proj = TOP_PATH + self.model_info.weights[LlmList.V_PROJ]
         o_proj = TOP_PATH + self.model_info.weights[LlmList.O_PROJ]
         post_attn_ln = TOP_PATH + self.model_info.weights[LlmList.POST_ATTN_LN]
+        # GEMMA4: per-layer, variable head_dim
+        _gemma4_head_dim = getattr(self, '_gemma4_head_dim_override', {}).get(idx, self.head_dim)
+        _gemma4_kv_dim = self.num_key_value_heads * _gemma4_head_dim
+        # GEMMA4: KV sharing -- use reference layer's k_proj/v_proj if they don't exist
+        if self.llm_type == LlmType.GEMMA4 and not self.model.is_exist(k_proj + ".weight"):
+            kv_ref = getattr(self, '_gemma4_kv_ref', {}).get(idx)
+            if kv_ref is not None:
+                ref_path = f'{self.model_info.weights[LlmList.LAYERS]}.{kv_ref}.'
+                k_proj = ref_path + self.model_info.weights[LlmList.K_PROJ]
+                k_norm = ref_path + self.model_info.weights[LlmList.K_NORM]
+                v_proj = ref_path + self.model_info.weights[LlmList.V_PROJ]
+        # GEMMA4: PLE weight paths
+        if self.llm_type == LlmType.GEMMA4 and getattr(self, '_gemma4_has_ple', False):
+            ple_input_gate = TOP_PATH + self.model_info.weights[LlmList.PER_LAYER_INPUT_GATE]
+            ple_proj = TOP_PATH + self.model_info.weights[LlmList.PER_LAYER_PROJECTION]
+            ple_norm = TOP_PATH + self.model_info.weights[LlmList.POST_PER_LAYER_INPUT_NORM]
+            layer_scalar_path = TOP_PATH + self.model_info.weights[LlmList.LAYER_SCALAR]
+            ple_dim = self.llm_config.hidden_size_per_layer_input
         if self.llm_type in [LlmType.QWEN2_MOE]:
             shared_gate = TOP_PATH + self.model_info.weights[LlmList.SHARED_GATE]
             shared_expert_gate = TOP_PATH + self.model_info.weights[LlmList.SHARED_EXPERT_GATE]
@@ -1584,7 +1602,7 @@ class LlmConverter(BaseConverter):
             mlp_gate = TOP_PATH + self.model_info.weights[LlmList.MLP_GATE]
             mlp_up = TOP_PATH + self.model_info.weights[LlmList.MLP_UP]
             mlp_down = TOP_PATH + self.model_info.weights[LlmList.MLP_DOWN]
-        if self.llm_type in [LlmType.GEMMA3]:
+        if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4]:
             pre_mlp_ln = TOP_PATH + self.model_info.weights[LlmList.PRE_MLP_LN]
             post_mlp_ln = TOP_PATH + self.model_info.weights[LlmList.POST_MLP_LN]
         norm = self.model_info.weights[LlmList.NORM]
@@ -1603,10 +1621,10 @@ class LlmConverter(BaseConverter):
         self.set_linear_weight(k_proj, weight_dict, do_lora=self.do_lora)
         self.set_linear_weight(v_proj, weight_dict, do_lora=self.do_lora)
         self.set_linear_weight(o_proj, weight_dict, do_lora=self.do_lora)
-        if self.llm_type in [LlmType.QWEN3, LlmType.GEMMA3]:
+        if self.llm_type in [LlmType.QWEN3, LlmType.GEMMA3, LlmType.GEMMA4]:
             self.set_common_weight(q_norm, weight_dict, self.rmsnorm_type)
             self.set_common_weight(k_norm, weight_dict, self.rmsnorm_type)
-        if self.llm_type in [LlmType.GEMMA3]:
+        if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4]:
             self.set_common_weight(pre_mlp_ln, weight_dict, self.rmsnorm_type)
             self.set_common_weight(post_mlp_ln, weight_dict, self.rmsnorm_type)
         self.set_common_weight(post_attn_ln, weight_dict, self.rmsnorm_type)
@@ -1679,6 +1697,11 @@ class LlmConverter(BaseConverter):
             self.set_linear_weight(mlp_down, weight_dict, do_lora=self.do_lora)
         if do_norm:
             self.set_common_weight(norm, weight_dict, self.rmsnorm_type)
+        if self.llm_type == LlmType.GEMMA4 and getattr(self, '_gemma4_has_ple', False):
+            self.set_linear_weight(ple_input_gate, weight_dict)
+            self.set_linear_weight(ple_proj, weight_dict)
+            self.set_common_weight(ple_norm, weight_dict, self.rmsnorm_type)
+            weight_dict[layer_scalar_path] = self.model.read(layer_scalar_path)
         if self.extern_block_weights:
             weight_dict.update(self.extern_block_weights)
         self.weight_keys.extend(list(weight_dict.keys()))
@@ -1689,7 +1712,7 @@ class LlmConverter(BaseConverter):
             batch = input_shape[0]
             len = input_shape[1]
             new_op = in_op
-            if self.llm_type in [LlmType.GEMMA3]:
+            if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4]:
                 new_op = self.rms_norm(mlir_gen, in_op, pre_mlp_ln)
             else:
                 new_op = self.rms_norm(mlir_gen, in_op, post_attn_ln)
@@ -1745,7 +1768,7 @@ class LlmConverter(BaseConverter):
                                        self.intermediate_size,
                                        self.hidden_act,
                                        do_lora=self.do_lora)
-            if self.llm_type in [LlmType.GEMMA3]:
+            if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4]:
                 down_op = self.rms_norm(mlir_gen, down_op, post_mlp_ln)
             if self.llm_type == LlmType.MINICPM4:
                 down_op = top.MulConstOp(mlir_gen.get_tensor_type(input_shape),
@@ -1774,14 +1797,20 @@ class LlmConverter(BaseConverter):
             id_shape[-1] = input_len
             mask_shape = [1, 1, input_len, input_len]
 
-            q_shape = [1, input_len, self.num_attention_heads, self.head_dim]
-            kv_shape = [1, input_len, self.num_key_value_heads, self.head_dim]
-            block_mlir = MLIRImporter([input_shape, id_shape, mask_shape],
-                                      [input_shape, kv_shape, kv_shape],
-                                      name,
-                                      self.platform, ["F32", "INT32", "F32"],
-                                      lora_rank=self.lora_rank,
-                                      weight_file=f"../{weight_file}")
+            q_shape = [1, input_len, self.num_attention_heads, _gemma4_head_dim]
+            kv_shape = [1, input_len, self.num_key_value_heads, _gemma4_head_dim]
+            inputs = [input_shape, id_shape, mask_shape]
+            input_types = ["F32", "INT32", "F32"]
+            outputs = [input_shape, kv_shape, kv_shape]
+            if self.llm_type == LlmType.GEMMA4 and getattr(self, '_gemma4_has_ple', False):
+                ple_input_shape = [1, input_len, ple_dim]
+                inputs.append(ple_input_shape)
+                input_types.append("F32")
+            block_mlir = MLIRImporter(inputs, outputs,
+                                       name,
+                                       self.platform, input_types,
+                                       lora_rank=self.lora_rank,
+                                       weight_file=f"../{weight_file}")
 
             T = block_mlir.get_tensor_type
             L = lambda name: self.get_loc(name, block_mlir)
@@ -1791,11 +1820,14 @@ class LlmConverter(BaseConverter):
             in0_op = block_mlir.create_input_op(L("input_states"), 0)
             in1_op = block_mlir.create_input_op(L("position_ids"), 1)
             in2_op = block_mlir.create_input_op(L("attention_mask"), 2)
+            ple_op = None
+            if self.llm_type == LlmType.GEMMA4 and getattr(self, '_gemma4_has_ple', False):
+                ple_op = block_mlir.create_input_op(L("per_layer_input"), 3)
             return_ops = []
             ln_op = self.rms_norm(block_mlir, in0_op, input_ln)
 
             # q_proj
-            q_dim = self.num_attention_heads * self.head_dim
+            q_dim = self.num_attention_heads * _gemma4_head_dim
             q_op = self.linear(block_mlir,
                                q_proj,
                                ln_op, [self.hidden_size, q_dim], [1, input_len, q_dim],
@@ -1803,23 +1835,23 @@ class LlmConverter(BaseConverter):
             # k_proj
             k_op = self.linear(block_mlir,
                                k_proj,
-                               ln_op, [self.hidden_size, self.kv_dim], [1, input_len, self.kv_dim],
+                               ln_op, [self.hidden_size, _gemma4_kv_dim], [1, input_len, _gemma4_kv_dim],
                                do_lora=self.do_lora)
 
             # v_proj
             v_op = self.linear(block_mlir,
                                v_proj,
-                               ln_op, [self.hidden_size, self.kv_dim], [1, input_len, self.kv_dim],
+                               ln_op, [self.hidden_size, _gemma4_kv_dim], [1, input_len, _gemma4_kv_dim],
                                do_lora=self.do_lora)
             # reshape q,k,v
             q_op = top.ReshapeOp(T(q_shape),
                                  q_op,
-                                 shape=[1, -1, self.num_attention_heads, self.head_dim],
+                                 shape=[1, -1, self.num_attention_heads, _gemma4_head_dim],
                                  loc=L(q_proj + ".reshape"),
                                  ip=ip).output
             k_op = top.ReshapeOp(T(kv_shape),
                                  k_op,
-                                 shape=[1, -1, self.num_key_value_heads, self.head_dim],
+                                 shape=[1, -1, self.num_key_value_heads, _gemma4_head_dim],
                                  loc=L(k_proj + ".reshape"),
                                  ip=ip).output
             v_op = top.ReshapeOp(T(kv_shape),
@@ -1827,7 +1859,7 @@ class LlmConverter(BaseConverter):
                                  shape=[1, -1, self.num_key_value_heads, self.head_dim],
                                  loc=L("v_cache"),
                                  ip=ip).output
-            if self.llm_type in [LlmType.QWEN3, LlmType.GEMMA3]:
+            if self.llm_type in [LlmType.QWEN3, LlmType.GEMMA3, LlmType.GEMMA4]:
                 q_op = self.rms_norm(block_mlir, q_op, q_norm)
                 k_op = self.rms_norm(block_mlir, k_op, k_norm)
 
@@ -1843,11 +1875,11 @@ class LlmConverter(BaseConverter):
                                      v_op,
                                      in2_op,
                                      block_mlir.none_op,
-                                     scale=self.head_dim**-0.5,
+                                     scale=_gemma4_head_dim**-0.5,
                                      batch=1,
                                      q_head=self.num_attention_heads,
                                      kv_head=self.num_key_value_heads,
-                                     dim=self.head_dim,
+                                     dim=_gemma4_head_dim,
                                      mq=input_len,
                                      mk=input_len,
                                      keep_dims=False,
@@ -1858,7 +1890,7 @@ class LlmConverter(BaseConverter):
                                fa_op, [q_dim, self.hidden_size],
                                input_shape,
                                do_lora=self.do_lora)
-            if self.llm_type == LlmType.GEMMA3:
+            if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4]:
                 o_op = self.rms_norm(block_mlir, o_op, post_attn_ln)
             if self.llm_type == LlmType.MINICPM4:
                 o_op = top.MulConstOp(T(input_shape),
@@ -1869,6 +1901,31 @@ class LlmConverter(BaseConverter):
             o_op = top.AddOp(T(input_shape), [in0_op, o_op], loc=L(o_proj + ".add"), ip=ip).output
             # ========== mlp =============
             new_op = gen_mlp(block_mlir, input_shape, o_op)
+            # ========== PLE (gemma4) ====
+            if self.llm_type == LlmType.GEMMA4 and getattr(self, '_gemma4_has_ple', False) and ple_op is not None:
+                ple_residual = new_op
+                ple_gate = self.linear(block_mlir, ple_input_gate, ple_residual,
+                                       [self.hidden_size, ple_dim], [1, input_len, ple_dim])
+                ple_act = self.activate(block_mlir, ple_gate, ActType.GELU_PYTORCH_TANH, ple_input_gate)
+                ple_mul = top.MulOp(T([1, input_len, ple_dim]), [ple_act, ple_op],
+                                    loc=L(ple_input_gate + ".mul"),
+                                    ip=ip).output
+                ple_proj_out = self.linear(block_mlir, ple_proj, ple_mul,
+                                           [ple_dim, self.hidden_size], [1, input_len, self.hidden_size])
+                ple_norm_out = self.rms_norm(block_mlir, ple_proj_out, ple_norm)
+                new_op = top.AddOp(T(input_shape), [ple_residual, ple_norm_out],
+                                   loc=L(ple_proj + ".add"),
+                                   ip=ip).output
+                layer_scalar_val = self.model.read(layer_scalar_path)
+                if hasattr(layer_scalar_val, 'ndim') and layer_scalar_val.ndim > 0:
+                    scalar = float(layer_scalar_val.reshape(-1)[0])
+                else:
+                    scalar = float(layer_scalar_val)
+                new_op = top.MulConstOp(T(input_shape),
+                                        new_op,
+                                        const_val=scalar,
+                                        loc=L(layer_scalar_path + ".scale"),
+                                        ip=ip).output
             block_mlir.create_return_op([new_op] + return_ops)
             mlir_txt = block_mlir.print_module()
             if not os.path.exists(name):
@@ -1896,10 +1953,10 @@ class LlmConverter(BaseConverter):
                 id_shape[0] = self.batch
             id_shape[-1] = 1
             mask_shape = [self.batch, 1, 1, mask_len]
-            history_shape = [self.batch, self.seq_length, self.num_key_value_heads, self.head_dim]
+            history_shape = [self.batch, self.seq_length, self.num_key_value_heads, _gemma4_head_dim]
 
-            q_shape = [self.batch, 1, self.num_attention_heads, self.head_dim]
-            kv_shape = [self.batch, 1, self.num_key_value_heads, self.head_dim]
+            q_shape = [self.batch, 1, self.num_attention_heads, _gemma4_head_dim]
+            kv_shape = [self.batch, 1, self.num_key_value_heads, _gemma4_head_dim]
             output_shapes = [input_shape] if self.use_insert else [input_shape, kv_shape, kv_shape]
             block_mlir = MLIRImporter(
                 [input_shape, id_shape, mask_shape, history_shape, history_shape],
@@ -1923,7 +1980,7 @@ class LlmConverter(BaseConverter):
             ln_op = self.rms_norm(block_mlir, in0_op, input_ln)
 
             # q_proj
-            q_dim = self.num_attention_heads * self.head_dim
+            q_dim = self.num_attention_heads * _gemma4_head_dim
             q_op = self.linear(block_mlir,
                                q_proj,
                                ln_op, [self.hidden_size, q_dim], [self.batch, 1, q_dim],
@@ -1931,18 +1988,18 @@ class LlmConverter(BaseConverter):
             # k_proj
             k_op = self.linear(block_mlir,
                                k_proj,
-                               ln_op, [self.hidden_size, self.kv_dim], [self.batch, 1, self.kv_dim],
+                               ln_op, [self.hidden_size, _gemma4_kv_dim], [self.batch, 1, _gemma4_kv_dim],
                                do_lora=self.do_lora)
             # v_proj
             v_op = self.linear(block_mlir,
                                v_proj,
-                               ln_op, [self.hidden_size, self.kv_dim], [self.batch, 1, self.kv_dim],
+                               ln_op, [self.hidden_size, _gemma4_kv_dim], [self.batch, 1, _gemma4_kv_dim],
                                do_lora=self.do_lora)
             # reshape q,k,v
             q_op = top.ReshapeOp(T(q_shape), q_op, loc=L(q_proj + ".reshape"), ip=ip).output
             k_op = top.ReshapeOp(T(kv_shape), k_op, loc=L(k_proj + ".reshape"), ip=ip).output
             v_op = top.ReshapeOp(T(kv_shape), v_op, loc=L("v_cache"), ip=ip).output
-            if self.llm_type in [LlmType.QWEN3, LlmType.GEMMA3]:
+            if self.llm_type in [LlmType.QWEN3, LlmType.GEMMA3, LlmType.GEMMA4]:
                 q_op = self.rms_norm(block_mlir, q_op, q_norm)
                 k_op = self.rms_norm(block_mlir, k_op, k_norm)
             # rotary cos/sin
@@ -1991,11 +2048,11 @@ class LlmConverter(BaseConverter):
                                      v_op,
                                      in2_op,
                                      block_mlir.none_op,
-                                     scale=self.head_dim**-0.5,
+                                     scale=_gemma4_head_dim**-0.5,
                                      batch=self.batch,
                                      q_head=self.num_attention_heads,
                                      kv_head=self.num_key_value_heads,
-                                     dim=self.head_dim,
+                                     dim=_gemma4_head_dim,
                                      mq=1,
                                      mk=mask_len,
                                      keep_dims=False,
@@ -2006,7 +2063,7 @@ class LlmConverter(BaseConverter):
                                fa_op, [q_dim, self.hidden_size],
                                input_shape,
                                do_lora=self.do_lora)
-            if self.llm_type == LlmType.GEMMA3:
+            if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4]:
                 o_op = self.rms_norm(block_mlir, o_op, post_attn_ln)
             if self.llm_type == LlmType.MINICPM4:
                 o_op = top.MulConstOp(T(input_shape),
@@ -2032,10 +2089,10 @@ class LlmConverter(BaseConverter):
             id_shape = list(self.position_shape)
             max_kv_len = self.max_prefill_kv_length + input_len
             mask_shape = [1, 1, input_len, max_kv_len]
-            history_shape = [1, self.max_prefill_kv_length, self.num_key_value_heads, self.head_dim]
+            history_shape = [1, self.max_prefill_kv_length, self.num_key_value_heads, _gemma4_head_dim]
 
-            q_shape = [1, input_len, self.num_attention_heads, self.head_dim]
-            kv_shape = [1, input_len, self.num_key_value_heads, self.head_dim]
+            q_shape = [1, input_len, self.num_attention_heads, _gemma4_head_dim]
+            kv_shape = [1, input_len, self.num_key_value_heads, _gemma4_head_dim]
 
             block_mlir = MLIRImporter(
                 [input_shape, id_shape, mask_shape, history_shape, history_shape],
@@ -2059,7 +2116,7 @@ class LlmConverter(BaseConverter):
             ln_op = self.rms_norm(block_mlir, in0_op, input_ln)
 
             # q_proj
-            q_dim = self.num_attention_heads * self.head_dim
+            q_dim = self.num_attention_heads * _gemma4_head_dim
             q_op = self.linear(block_mlir,
                                q_proj,
                                ln_op, [self.hidden_size, q_dim], [1, input_len, q_dim],
@@ -2067,30 +2124,30 @@ class LlmConverter(BaseConverter):
             # k_proj
             k_op = self.linear(block_mlir,
                                k_proj,
-                               ln_op, [self.hidden_size, self.kv_dim], [1, input_len, self.kv_dim],
+                               ln_op, [self.hidden_size, _gemma4_kv_dim], [1, input_len, _gemma4_kv_dim],
                                do_lora=self.do_lora)
             # v_proj
             v_op = self.linear(block_mlir,
                                v_proj,
-                               ln_op, [self.hidden_size, self.kv_dim], [1, input_len, self.kv_dim],
+                               ln_op, [self.hidden_size, _gemma4_kv_dim], [1, input_len, _gemma4_kv_dim],
                                do_lora=self.do_lora)
             # reshape q,k,v
             q_op = top.ReshapeOp(T(q_shape),
                                  q_op,
-                                 shape=[1, -1, self.num_attention_heads, self.head_dim],
+                                 shape=[1, -1, self.num_attention_heads, _gemma4_head_dim],
                                  loc=L(q_proj + ".reshape"),
                                  ip=ip).output
             k_op = top.ReshapeOp(T(kv_shape),
                                  k_op,
-                                 shape=[1, -1, self.num_key_value_heads, self.head_dim],
+                                 shape=[1, -1, self.num_key_value_heads, _gemma4_head_dim],
                                  loc=L(k_proj + ".reshape"),
                                  ip=ip).output
             v_op = top.ReshapeOp(T(kv_shape),
                                  v_op,
-                                 shape=[1, -1, self.num_key_value_heads, self.head_dim],
+                                 shape=[1, -1, self.num_key_value_heads, _gemma4_head_dim],
                                  loc=L("v_cache"),
                                  ip=ip).output
-            if self.llm_type in [LlmType.QWEN3, LlmType.GEMMA3]:
+            if self.llm_type in [LlmType.QWEN3, LlmType.GEMMA3, LlmType.GEMMA4]:
                 q_op = self.rms_norm(block_mlir, q_op, q_norm)
                 k_op = self.rms_norm(block_mlir, k_op, k_norm)
             # rotary cos/sin
@@ -2118,11 +2175,11 @@ class LlmConverter(BaseConverter):
                                      v_op,
                                      in2_op,
                                      block_mlir.none_op,
-                                     scale=self.head_dim**-0.5,
+                                     scale=_gemma4_head_dim**-0.5,
                                      batch=1,
                                      q_head=self.num_attention_heads,
                                      kv_head=self.num_key_value_heads,
-                                     dim=self.head_dim,
+                                     dim=_gemma4_head_dim,
                                      mq=input_len,
                                      mk=max_kv_len,
                                      keep_dims=False,
@@ -2133,7 +2190,7 @@ class LlmConverter(BaseConverter):
                                fa_op, [q_dim, self.hidden_size],
                                input_shape,
                                do_lora=self.do_lora)
-            if self.llm_type == LlmType.GEMMA3:
+            if self.llm_type in [LlmType.GEMMA3, LlmType.GEMMA4]:
                 o_op = self.rms_norm(block_mlir, o_op, post_attn_ln)
             if self.llm_type == LlmType.MINICPM4:
                 o_op = top.MulConstOp(T(input_shape),

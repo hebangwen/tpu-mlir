@@ -66,6 +66,7 @@ LLM_CONVERTERS = [
     (("qwen3_asr", ), "llm.Qwen3AsrConverter", "Qwen3AsrConverter", {}),
     (("internvl_chat", ), "llm.InternVL3Converter", "InternVL3Converter", {}),
     (("gemma3", ), "llm.Gemma3Converter", "Gemma3Converter", {}),
+    (("gemma4", ), "llm.Gemma4Converter", "Gemma4Converter", {}),
     (("glm4v", ), "llm.GLM4VConverter", "GLM4VConverter", {
         "pixel_multiple": 28
     }),

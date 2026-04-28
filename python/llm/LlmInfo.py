@@ -41,6 +41,7 @@ class LlmType:
     QWEN3_5 = "qwen3_5_text"
     CHATGLM3 = "chatglm"
     GEMMA3 = "gemma3_text"
+    GEMMA4 = "gemma4_text"
     MINICPM4 = "minicpm"
     GLM4V = "glm4v_text"
     LFM2 = "lfm2_text"
@@ -103,6 +104,11 @@ class LlmList:
     EXPERTS_GATE = "EXPERTS_GATE"
     EXPERTS_UP = "EXPERTS_UP"
     EXPERTS_DOWN = "EXPERTS_DOWN"
+    # PLE (Per-Layer Embeddings) -- gemma4
+    PER_LAYER_INPUT_GATE = "PER_LAYER_INPUT_GATE"
+    PER_LAYER_PROJECTION = "PER_LAYER_PROJECTION"
+    POST_PER_LAYER_INPUT_NORM = "POST_PER_LAYER_INPUT_NORM"
+    LAYER_SCALAR = "LAYER_SCALAR"
     # ===============================
     NORM = "NORM"
     LMHEAD = "LMHEAD"
@@ -355,6 +361,35 @@ QWEN3VL_INFO = ModelInfo(
         # ================================
         LlmList.NORM: "model.language_model.norm",
         LlmList.LMHEAD: "lm_head",
+    })
+
+# gemma4
+GEMMA4_INFO = ModelInfo(
+    ModelConfig(hidden_act="hidden_activation", ),
+    weights={
+        LlmList.LAYERS: "model.language_model.layers",
+        LlmList.EMBEDING: "model.language_model.embed_tokens",
+        # ========= in layers =============
+        LlmList.INPUT_LN: "input_layernorm",
+        LlmList.Q_PROJ: "self_attn.q_proj",
+        LlmList.Q_NORM: "self_attn.q_norm",
+        LlmList.K_PROJ: "self_attn.k_proj",
+        LlmList.K_NORM: "self_attn.k_norm",
+        LlmList.V_PROJ: "self_attn.v_proj",
+        LlmList.O_PROJ: "self_attn.o_proj",
+        LlmList.POST_ATTN_LN: "post_attention_layernorm",
+        LlmList.PRE_MLP_LN: "pre_feedforward_layernorm",
+        LlmList.POST_MLP_LN: "post_feedforward_layernorm",
+        LlmList.MLP_GATE: "mlp.gate_proj",
+        LlmList.MLP_UP: "mlp.up_proj",
+        LlmList.MLP_DOWN: "mlp.down_proj",
+        LlmList.PER_LAYER_INPUT_GATE: "per_layer_input_gate",
+        LlmList.PER_LAYER_PROJECTION: "per_layer_projection",
+        LlmList.POST_PER_LAYER_INPUT_NORM: "post_per_layer_input_norm",
+        LlmList.LAYER_SCALAR: "layer_scalar",
+        # ================================
+        LlmList.NORM: "model.language_model.norm",
+        LlmList.LMHEAD: "model.language_model.lm_head",
     })
 
 LFM2_INFO = ModelInfo(
